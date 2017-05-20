@@ -50,6 +50,24 @@ static inline struct cn_msg *buffer_to_cn_msg(__u8 *buffer)
 	return (struct cn_msg *)(buffer + 4);
 }
 
+/*
+ * Tracking number of listeners is not enough. A process can subscribe
+ * several times or unsubscribe without being subscribed. Therefore, there
+ * could be a negative amount of subscribers or their number might be bigger
+ * than the actual number of active listeners.
+ * Tracking the listeners themselves is required to avoid these situations.
+ * */
+struct cn_listener_list {
+	struct list_head listeners;
+	pid_t pid;
+	spinlock_t listeners_lock;
+};
+static struct cn_listener_list listeners;
+
+static void cn_add_listener(struct task_struct *task);
+static void cn_del_listener(struct task_struct *task);
+static struct cn_listener_list *create_listener(pid_t pid);
+
 static atomic_t proc_event_num_listeners = ATOMIC_INIT(0);
 static struct cb_id cn_proc_event_id = { CN_IDX_PROC, CN_VAL_PROC };
 
@@ -293,6 +311,8 @@ void proc_exit_connector(struct task_struct *task)
 	if (atomic_read(&proc_event_num_listeners) < 1)
 		return;
 
+	cn_del_listener(task);
+
 	msg = buffer_to_cn_msg(buffer);
 	ev = (struct proc_event *)msg->data;
 	memset(&ev->event_data, 0, sizeof(ev->event_data));
@@ -346,6 +366,87 @@ static void cn_proc_ack(int err, int rcvd_seq, int rcvd_ack)
 	cn_netlink_send(msg, 0, CN_IDX_PROC, GFP_KERNEL);
 }
 
+/*
+ * Adds a listener to the list of listeners.
+ *
+ * Does nothing if the listener is registered already.
+ * */
+static void cn_add_listener(struct task_struct *task)
+{
+	int found = 0;
+	struct cn_listener_list *listener;
+	struct cn_listener_list *new_listener;
+
+	spin_lock_bh(&listeners.listeners_lock);
+
+	list_for_each_entry(listener, &listeners.listeners, listeners) {
+		if (listener->pid == task->pid) {
+			found = 1;
+			break;
+		}
+	}
+
+	if (!found) {
+		new_listener = create_listener(task->pid);
+		if (new_listener) {
+			list_add(&new_listener->listeners, &listeners.listeners);
+			atomic_inc(&proc_event_num_listeners);
+		}
+	}
+
+	spin_unlock_bh(&listeners.listeners_lock);
+}
+
+/*
+ * Removes a listener from the list of listeners.
+ *
+ * Does nothing if the listener is not registered already.
+ * */
+static void cn_del_listener(struct task_struct *task)
+{
+	int found = 0;
+	struct cn_listener_list *listener;
+
+	spin_lock_bh(&listeners.listeners_lock);
+
+	list_for_each_entry(listener, &listeners.listeners, listeners) {
+		if (listener->pid == task->pid) {
+			found = 1;
+			break;
+		}
+	}
+
+	if (found) {
+		list_del(&listener->listeners);
+		kfree(listener);
+		atomic_dec(&proc_event_num_listeners);
+	}
+
+	spin_unlock_bh(&listeners.listeners_lock);
+}
+
+/*
+ * Allocates new cn_listener_list entry.
+ *
+ * The new list is supposed to be freed whenever the listener is
+ * removed from the list of listeners.
+ * */
+static struct cn_listener_list *create_listener(pid_t pid)
+{
+	struct cn_listener_list *list;
+
+	list = kzalloc(sizeof(struct cn_listener_list), GFP_KERNEL);
+	if (!list) {
+		pr_err("Failed to create new listener list.\n");
+		return NULL;
+	}
+	INIT_LIST_HEAD(&list->listeners);
+	spin_lock_init(&list->listeners_lock);
+	list->pid = pid;
+
+	return list;
+}
+
 /**
  * cn_proc_mcast_ctl
  * @data: message sent from userspace via the connector
@@ -359,7 +460,7 @@ static void cn_proc_mcast_ctl(struct cn_msg *msg,
 	if (msg->len != sizeof(*mc_op))
 		return;
 
-	/* 
+	/*
 	 * Events are reported with respect to the initial pid
 	 * and user namespaces so ignore requestors from
 	 * other namespaces.
@@ -377,10 +478,10 @@ static void cn_proc_mcast_ctl(struct cn_msg *msg,
 	mc_op = (enum proc_cn_mcast_op *)msg->data;
 	switch (*mc_op) {
 	case PROC_CN_MCAST_LISTEN:
-		atomic_inc(&proc_event_num_listeners);
+		cn_add_listener(current);
 		break;
 	case PROC_CN_MCAST_IGNORE:
-		atomic_dec(&proc_event_num_listeners);
+		cn_del_listener(current);
 		break;
 	default:
 		err = EINVAL;
@@ -405,6 +506,10 @@ static int __init cn_proc_init(void)
 		pr_warn("cn_proc failed to register\n");
 		return err;
 	}
+
+	INIT_LIST_HEAD(&listeners.listeners);
+	spin_lock_init(&listeners.listeners_lock);
+
 	return 0;
 }
 
